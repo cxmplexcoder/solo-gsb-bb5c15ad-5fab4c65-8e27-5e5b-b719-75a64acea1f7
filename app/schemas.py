@@ -1,21 +1,72 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, Field, field_validator
 
 PositiveInt = Annotated[int, Field(ge=1)]
 
 # 对外稳定的瑕疵类型枚举（中文契约）
 DefectType = Literal["模糊", "划痕", "曝光异常"]
 
+# 帧号/预期起止的统一上界：SQLite 原生有符号 64 位整数上限（2^63-1）。
+# 超过该范围的值无法以 INTEGER 落库（会触发服务错误），必须在入口拒绝。
+SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
+FRAME_NUMBER_DOMAIN_TEXT = "0 至 9223372036854775807"
+
+
+def _validate_frame_number(value: Any) -> int:
+    """帧号专用校验：仅接受 Python 原生 int（即 JSON 整数），范围 [0, 2^63-1]。
+
+    在 Pydantic 自身类型转换**之前**执行（BeforeValidator），拒绝两类此前会被
+    宽松模式静默转换的输入：
+
+    - 布尔值：Python 中 ``bool`` 是 ``int`` 的子类（``True/False`` 会被当作 1/0）；
+    - 浮点：``1.0`` 这类整数型浮点数会被转成整数 ``1``。
+
+    同时统一限制取值区间为 [0, 9223372036854775807]：负帧此前会被普通
+    导入接受，超过 SQLite 整数范围的预期终点则会在写库时触发服务错误。任何非法
+    值都在此抛 ValueError，由 FastAPI 转为 ``422``——发生在内容指纹、缺帧
+    计算与写库之前。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            "帧号必须是原生整数（JSON 整数），不接受布尔值 true/false 或小数（如 1.0）"
+        )
+    if value < 0 or value > SQLITE_INTEGER_MAX:
+        raise ValueError(f"帧号必须是 {FRAME_NUMBER_DOMAIN_TEXT} 范围内的整数")
+    return value
+
+
+# 扫描帧号 / 批次预期起止的统一类型：原生整数、闭区间 [0, 2^63-1]。
+# 普通批次导入、批次预检与补扫回执三个入口共用，保证在内容指纹、缺帧计算
+# 与写库之前就拒绝非法值（422）。
+FrameNo = Annotated[
+    int,
+    BeforeValidator(_validate_frame_number),
+    Field(ge=0, le=SQLITE_INTEGER_MAX),
+]
+
 
 class BatchIn(BaseModel):
     roll_no: str = Field(..., min_length=1, description="胶卷编号")
-    expected_start: int = Field(..., ge=0, description="预期帧号起始（含）")
-    expected_end: int = Field(..., ge=0, description="预期帧号结束（含）")
-    frames: list[int] = Field(..., min_length=1, description="本批扫描帧号列表")
+    expected_start: FrameNo = Field(
+        ...,
+        description="预期帧号起始（含）；0 至 9223372036854775807 的原生整数（拒绝布尔值/小数）",
+    )
+    expected_end: FrameNo = Field(
+        ...,
+        description="预期帧号结束（含）；0 至 9223372036854775807 的原生整数，且 end ≥ start",
+    )
+    frames: list[FrameNo] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "本批扫描帧号列表（至少 1 个；每项为 0 至 9223372036854775807 "
+            "的原生整数，拒绝布尔值与小数；批内重复会被识别为重复帧）"
+        ),
+    )
     batch_id: str | None = Field(
         None, description="客户端批次号（可选）；留空则按内容生成"
     )
@@ -496,8 +547,13 @@ class RescanClaimOut(BaseModel):
 
 class RescanReceiptIn(BaseModel):
     batch_id: str = Field(..., min_length=1, description="本次补扫批次号（必填）")
-    frames: list[int] = Field(
-        ..., min_length=1, description="本次实际扫到的非空帧号列表（原始列表，至少 1 个）"
+    frames: list[FrameNo] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "本次实际扫到的非空帧号列表（原始列表，至少 1 个；每项为 0 至 "
+            "9223372036854775807 的原生整数，拒绝布尔值与小数；批内重复识别为重复帧）"
+        ),
     )
 
     @field_validator("batch_id")
