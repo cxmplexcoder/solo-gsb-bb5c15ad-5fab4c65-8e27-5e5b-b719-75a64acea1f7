@@ -7,15 +7,25 @@ from pydantic import BaseModel, Field, field_validator
 
 PositiveInt = Annotated[int, Field(ge=1)]
 
+# 帧号 / 预期起止统一为 0 至 SQLite 有符号 64 位整数上限的**原生整数**：
+# strict=True 拒绝 bool（JSON 的 true/false）与整数型浮点数（如 1.0），
+# ge/le 拒绝负数与超出 SQLite INTEGER 范围的值（否则写库时抛 OverflowError）。
+SQLITE_INTEGER_MAX = 2**63 - 1
+FrameNo = Annotated[
+    int, Field(strict=True, ge=0, le=SQLITE_INTEGER_MAX)
+]
+
 # 对外稳定的瑕疵类型枚举（中文契约）
 DefectType = Literal["模糊", "划痕", "曝光异常"]
 
 
 class BatchIn(BaseModel):
     roll_no: str = Field(..., min_length=1, description="胶卷编号")
-    expected_start: int = Field(..., ge=0, description="预期帧号起始（含）")
-    expected_end: int = Field(..., ge=0, description="预期帧号结束（含）")
-    frames: list[int] = Field(..., min_length=1, description="本批扫描帧号列表")
+    expected_start: FrameNo = Field(..., description="预期帧号起始（含），0 至 9223372036854775807 的整数")
+    expected_end: FrameNo = Field(..., description="预期帧号结束（含），0 至 9223372036854775807 的整数，end ≥ start")
+    frames: list[FrameNo] = Field(
+        ..., min_length=1, description="本批扫描帧号列表；每项为 0 至 9223372036854775807 的整数（不接受布尔值、浮点或负数）"
+    )
     batch_id: str | None = Field(
         None, description="客户端批次号（可选）；留空则按内容生成"
     )
@@ -496,8 +506,11 @@ class RescanClaimOut(BaseModel):
 
 class RescanReceiptIn(BaseModel):
     batch_id: str = Field(..., min_length=1, description="本次补扫批次号（必填）")
-    frames: list[int] = Field(
-        ..., min_length=1, description="本次实际扫到的非空帧号列表（原始列表，至少 1 个）"
+    frames: list[FrameNo] = Field(
+        ...,
+        min_length=1,
+        description="本次实际扫到的非空帧号列表（原始列表，至少 1 个）；"
+        "每项为 0 至 9223372036854775807 的整数（不接受布尔值、浮点或负数）",
     )
 
     @field_validator("batch_id")

@@ -11,6 +11,54 @@ from datetime import datetime, timedelta, timezone
 from . import schemas
 
 
+# 帧号 / 预期起止的合法区间与 Pydantic 层（schemas.FrameNo）保持一致：
+# 只接受 0 至 SQLite 有符号 64 位整数上限的原生 int。服务层再校验一遍，
+# 保证绕过 HTTP 模型直接调用服务时也会在内容指纹、缺帧计算与写库之前拒绝。
+FRAME_NO_MIN = 0
+FRAME_NO_MAX = 2**63 - 1
+
+
+class FrameValidationError(ValueError):
+    """帧号或预期起止不是 [0, 9223372036854775807] 内的原生整数。
+
+    接口层映射为 422 Unprocessable Entity。
+    """
+
+
+def _validate_frame_inputs(
+    expected_start: int,
+    expected_end: int,
+    frames: list[int],
+) -> None:
+    """在内容指纹、缺帧区间计算与写库之前统一校验帧号输入。
+
+    拒绝 bool（Python 中 bool 是 int 子类，但语义上不是帧号）、非 int、
+    超出 [0, 2**63−1] 的值，以及 end < start。帧列表为空的情况由请求
+    模型的 min_length=1 负责，这里不重复要求。
+    """
+    for name, value in (
+        ("expected_start", expected_start),
+        ("expected_end", expected_end),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise FrameValidationError(f"{name} 必须是整数帧号（不接受布尔值或浮点数）")
+        if not FRAME_NO_MIN <= value <= FRAME_NO_MAX:
+            raise FrameValidationError(
+                f"{name} 必须位于 {FRAME_NO_MIN} 至 {FRAME_NO_MAX} 之间"
+            )
+    if expected_end < expected_start:
+        raise FrameValidationError("expected_end 不能小于 expected_start")
+    for i, f in enumerate(frames):
+        if isinstance(f, bool) or not isinstance(f, int):
+            raise FrameValidationError(
+                f"frames[{i}] 必须是整数帧号（不接受布尔值或浮点数）"
+            )
+        if not FRAME_NO_MIN <= f <= FRAME_NO_MAX:
+            raise FrameValidationError(
+                f"frames[{i}] 必须位于 {FRAME_NO_MIN} 至 {FRAME_NO_MAX} 之间"
+            )
+
+
 # ---------- 纯函数（便于测试） ----------
 
 def content_hash(roll_no: str, start: int, end: int, frames: list[int]) -> str:
@@ -398,6 +446,11 @@ def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schem
 
     幂等保证：(roll_no, 内容指纹) 唯一。相同内容重复导入不写任何数据。
     """
+    # 内容指纹计算前先统一校验帧号边界（非法值 422，不进事务、不写库）
+    _validate_frame_inputs(
+        data.expected_start, data.expected_end, list(data.frames)
+    )
+
     frames = sorted(set(data.frames))
     digest = content_hash(
         data.roll_no, data.expected_start, data.expected_end, frames
@@ -529,6 +582,11 @@ def create_precheck(
     （修订号为 0），同样允许预检。
     """
     precheck_id = uuid.uuid4().hex
+
+    # 内容指纹与缺帧计算前先统一校验帧号边界（非法值 422，不落预检单）
+    _validate_frame_inputs(
+        data.expected_start, data.expected_end, list(data.frames)
+    )
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1216,6 +1274,13 @@ def submit_rescan_receipt(
         ).fetchone()
         if claim is None:
             raise ClaimNotFoundError(claim_id)
+
+        # 认领存在后先统一校验帧号边界（非法值 422）：必须在幂等比对、
+        # 缺帧集合计算与批次写库之前拒绝布尔值、浮点、负数或超出
+        # SQLite INTEGER 范围的帧号；预期范围即认领闭区间（本就合法）
+        _validate_frame_inputs(
+            claim["frame_start"], claim["frame_end"], frames_in
+        )
 
         existing_receipt = conn.execute(
             "SELECT * FROM rescan_receipts WHERE claim_id = ?", (claim_id,)

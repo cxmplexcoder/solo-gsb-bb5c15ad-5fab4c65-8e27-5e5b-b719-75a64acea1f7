@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="胶片档案扫描整理 API",
     description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）；支持批次导入预检（持久化预检单、确认时在同一写事务内复核创建时的单调批次修订号，任何实际批次导入/撤销均使旧预检 409 失效）；支持扫描瑕疵复核（按原始帧列表 0 起算位置登记模糊/划痕/曝光异常，实时计算全出现被标记的瑕疵队列）；支持胶卷交付核验（同一事务内核验三类阻断项，全空时签发冻结核验依据与状态指纹的持久化凭证，凭证按当前批次与瑕疵标记重算有效性，历史凭证不改写）；支持胶卷母版选片（在请求区间与当前预期覆盖的交集内逐帧剔除瑕疵出现，按最少批次切换选择每帧母版来源，返回未扫描区间与无合格候选帧，缺帧只做区间运算）；支持批次帧号整体偏移诊断（按其余存活批次重建实扫基线与缺帧，区间事件扫描求最优整体偏移，严格优于零偏移才给出建议）。",
-    version="1.12.0",
+    version="1.13.0",
     lifespan=lifespan,
 )
 
@@ -50,6 +50,8 @@ def submit_batch(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"batch_id '{e.batch_id}' 已被其他内容占用，请更换后重试",
         )
+    except services.FrameValidationError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     response.status_code = code
     return result
 
@@ -71,7 +73,10 @@ def create_batch_precheck(
     指纹与**批次修订号**。可凭预检单 ID 调用确认接口；确认前该胶卷若有批次
     实际导入或撤销（修订号前进，即使汇总不变），确认返回 409。
     """
-    return services.create_precheck(conn, payload)
+    try:
+        return services.create_precheck(conn, payload)
+    except services.FrameValidationError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
 
 
 @app.get(
@@ -549,6 +554,8 @@ def submit_rescan_receipt(
         result, code = services.submit_rescan_receipt(conn, claim_id, payload)
     except services.ClaimNotFoundError:
         raise HTTPException(status_code=404, detail="补扫任务不存在")
+    except services.FrameValidationError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except services.ClaimUnavailableError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except services.ReceiptConflictError as e:
